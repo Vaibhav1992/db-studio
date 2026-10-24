@@ -1,5 +1,6 @@
 // Typed wrappers over the Rust commands in src-tauri/src/lib.rs. Keep the two in sync.
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager';
 
 // In `pnpm dev` inside a normal browser (no Tauri), call the debug-only HTTP bridge
@@ -52,7 +53,13 @@ export interface QueryResult {
   results: ResultSet[];
   messages: string[]; // e.g. "(3 rows affected)", "Batch 2: ..."
   elapsed_ms: number;
+  steps: Steps;
 }
+
+/** Where the time went: [step, ms], e.g. ["Azure token", 1800], ["TCP", 40], ["Login (TLS + auth)", 600], ["Server", 90], ["Rows", 20]. */
+export type Steps = [string, number][];
+/** Live progress of one session (`dbs-phase` event). now = current phase, null = finished. */
+export interface Phase { session: string; now: string | null; steps: Steps }
 
 export type TodoStatus = 'todo' | 'done' | 'failed';
 
@@ -101,6 +108,8 @@ export const api = {
   /** Procedure/view/function/trigger source as `CREATE OR ALTER ...`. */
   getDefinition: (connId: string, database: string, schema: string, name: string) =>
     invoke<string>('get_definition', { connId, database, schema, name }),
+  /** Live connect/query phases for every session. No-op in the browser bridge. */
+  onPhase: (cb: (p: Phase) => void) => { if (!bridged) listen<Phase>('dbs-phase', (e) => cb(e.payload)); },
   /** Drops the session's connection, which aborts a running query. */
   cancelQuery: (session: string) => invoke<void>('cancel_query', { session }),
   closeSession: (session: string) => invoke<void>('close_session', { session }),

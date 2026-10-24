@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api, clipboard, type Column, type Conn, type DbObject, type Env } from './api';
-  import { app, ENVS, envColor, newTab, loadConns, clearDatabases, databases, confirmDlg, qid, clearSchema, wask, execute, CANCELLED } from './store.svelte';
+  import { app, ENVS, envColor, newTab, loadConns, clearDatabases, databases, confirmDlg, qid, clearSchema, wask, execute, CANCELLED, phases, fmtSteps } from './store.svelte';
   import ConnDialog from './ConnDialog.svelte';
   import Icon from './Icon.svelte';
   import ContextMenu, { SEP, type MenuItem } from './ContextMenu.svelte';
@@ -22,9 +22,12 @@
     try { cache = { ...cache, [key]: { data: await p } }; } catch (e) { cache = { ...cache, [key]: { err: String(e) } }; }
   }
 
-  function msg(r: Row[], key: string, depth: number, e: Entry) {
-    r.push({ key: key + '/m', depth, kind: 'msg', label: e.err ?? (e.data ? '(empty)' : 'Loading...'), sub: e.err ? 'err' : 'dim' });
+  // While loading, show the live phase of the backend session (Azure token, TCP, login, query) and the steps done so far.
+  function msg(r: Row[], key: string, depth: number, e: Entry, session: string) {
+    const p = phases[session], live = p?.now ? [p.now + '...', fmtSteps(p.steps)].filter(Boolean).join(' · ') : 'Loading...';
+    r.push({ key: key + '/m', depth, kind: 'msg', label: e.err ?? (e.data ? '(empty)' : live), sub: e.err ? 'err' : 'dim' });
   }
+  const loadTime = (session: string) => (phases[session]?.now === null ? 'Last load: ' + fmtSteps(phases[session].steps) : undefined);
 
   const rows = $derived.by(() => {
     const r: Row[] = [];
@@ -44,7 +47,7 @@
           if (!dopen) continue;
           const dbs = cache[ck];
           dl = dbs?.data as string[] | undefined;
-          if (!dl?.length) { msg(r, dk, 3, dbs ?? {}); continue; }
+          if (!dl?.length) { msg(r, dk, 3, dbs ?? {}, `explorer:${c.id}:`); continue; }
           d = 3;
         }
         for (const db of dl) {
@@ -52,7 +55,7 @@
           r.push({ key: bk, depth: d, label: db, kind: 'db', open: bopen, folder: true, c, db });
           if (!bopen) continue;
           const objs = cache[bk];
-          if (!objs?.data) { msg(r, bk, d + 1, objs ?? {}); continue; }
+          if (!objs?.data) { msg(r, bk, d + 1, objs ?? {}, `explorer:${c.id}:${db}`); continue; }
           for (const [kind, title] of KINDS) {
             const list: DbObject[] = (objs.data as DbObject[]).filter((x) => x.kind === kind);
             const gk = `${bk}|${kind}`;
@@ -63,7 +66,7 @@
               r.push({ key: ok, depth: d + 2, label: o.name, sub: o.schema, kind: 'obj', open: open[ok], folder: kind === 'table', c, db, o });
               if (!open[ok] || kind !== 'table') continue;
               const cols = cache[ok];
-              if (!cols?.data) { msg(r, ok, d + 3, cols ?? {}); continue; }
+              if (!cols?.data) { msg(r, ok, d + 3, cols ?? {}, `explorer:${c.id}:${db}`); continue; }
               for (const col of cols.data as Column[]) r.push({ key: `${ok}|${col.name}`, depth: d + 3, label: col.name, kind: 'col', sub: `${col.type}, ${col.nullable ? 'null' : 'not null'}` });
             }
           }
@@ -199,6 +202,7 @@
   {#each rows as r (r.key)}
     {@const kind = r.o?.kind ?? r.kind}
     <div class="n" class:env={r.kind === 'env'} class:sel={selected === r.key} style="--d:{r.depth};--e:{envColor(r.env)}"
+      title={r.kind === 'db' ? loadTime(`explorer:${r.c!.id}:${r.db}`) : r.kind === 'conn' && !r.c?.database ? loadTime(`explorer:${r.c!.id}:`) : undefined}
       data-testid="tree-row" data-kind={kind} data-name={r.o ? `${r.o.schema}.${r.o.name}` : r.kind === 'dir' || r.kind === 'msg' ? r.label : r.kind === 'db' ? r.db : r.label}
       onclick={(e) => { selected = r.key; if (e.detail < 2) toggle(r); }} ondblclick={() => (r.o?.kind === 'table' || r.o?.kind === 'view') && top100(r)}
       oncontextmenu={(e) => ctx(e, r)} role="treeitem" aria-selected={selected === r.key} aria-expanded={r.folder ? !!r.open : undefined} tabindex="-1" onkeydown={() => {}}>

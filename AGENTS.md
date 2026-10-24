@@ -47,6 +47,11 @@ app/
 
 - **Sessions:** one TDS connection per session key: a tab id, `explorer:<conn>:<db>`, `todo:<id>`, `drop:<conn>`.
   The client is taken out of the map while a query runs. **Cancel** aborts the task and drops the socket.
+- **Spare connections:** after a session opens a new connection, `refill` opens one spare per (connection, database)
+  in the background. The next new session on that key takes it and skips TCP + TLS + login. TCP keepalive (30 s)
+  keeps idle sockets alive through VPN/NAT. `close("explorer:<conn>:<db>")` also drops that database's spares.
+- **Timing:** `Trace` records (step, ms) for token, TCP, login, server, rows. It sends live `dbs-phase` events
+  (tab toolbar, tree "Loading" rows) and returns `steps` in `QueryResult` (tab status bar). The az token is warmed on start.
 - **Azure:** `az account get-access-token --resource https://database.windows.net/`, cached until 5 min before
   expiry. `az_bin()` also searches `/opt/homebrew/bin` and `/usr/local/bin`, because apps opened from Finder
   get a minimal PATH. Azure routing redirects are followed.

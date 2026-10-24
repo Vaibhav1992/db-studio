@@ -3,7 +3,8 @@ use crate::{sqlguard, store::Conn};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use futures_util::TryStreamExt;
 use serde::Serialize;
-use std::{collections::HashMap, sync::Mutex, time::Instant};
+use std::{collections::HashMap, sync::{Mutex, OnceLock}, time::{Duration, Instant}};
+use tauri::{AppHandle, Emitter, Manager};
 use tiberius::{AuthMethod, Client, ColumnData, Config, FromSql, QueryItem};
 use tokio::{net::TcpStream, task::AbortHandle};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -13,8 +14,15 @@ const HARD_CAP: usize = 200_000; // per result set, protects UI memory when the 
 const ROWCOUNT_COL: &str = "__dbstudio_rowcount";
 const OPEN_TRAN: u32 = 50_871; // our THROW code for "tab has an open transaction"
 
+type Key = (Conn, Option<String>); // full record: an edited server/auth must not reuse the old socket
+
+/// The database a connection really opens, so a pinned connection's tab and its tree share one key.
+fn key(c: &Conn, database: Option<&str>) -> Key {
+    (c.clone(), database.or(c.database.as_deref()).filter(|d| !d.is_empty()).map(String::from))
+}
+
 struct Session {
-    key: (Conn, Option<String>), // full record: an edited server/auth must not reuse the old socket
+    key: Key,
     client: Tds,
 }
 
@@ -24,6 +32,47 @@ pub struct Db {
     sessions: Mutex<HashMap<String, Session>>,
     running: Mutex<HashMap<String, AbortHandle>>,
     tokens: tokio::sync::Mutex<HashMap<String, (String, i64)>>, // tenant -> (token, expires_on unix)
+    spares: Mutex<Vec<(Key, Option<Tds>)>>, // one pre-opened connection per key; None = still opening
+    pub app: OnceLock<AppHandle>, // unset in tests: no events, no pre-opened connections
+}
+
+/// Where a call's time goes: (step, ms) pairs. Live progress goes to the UI as the `dbs-phase` event.
+pub struct Trace {
+    app: Option<AppHandle>,
+    session: String,
+    last: Instant,
+    steps: Vec<(String, u64)>,
+}
+
+#[derive(Serialize, Clone)]
+struct Phase<'a> {
+    session: &'a str,
+    now: Option<&'a str>, // None = finished
+    steps: &'a [(String, u64)],
+}
+
+impl Trace {
+    pub fn new(db: &Db, session: &str) -> Self {
+        Trace { app: db.app.get().cloned(), session: session.into(), last: Instant::now(), steps: vec![] }
+    }
+    pub fn quiet() -> Self {
+        Trace { app: None, session: String::new(), last: Instant::now(), steps: vec![] }
+    }
+    /// Start the phase `now` (None = finished) and tell the UI.
+    fn go(&mut self, now: Option<&str>) {
+        self.last = Instant::now();
+        if let Some(a) = &self.app {
+            let _ = a.emit("dbs-phase", Phase { session: &self.session, now, steps: &self.steps });
+        }
+    }
+    /// End the current phase as step `name`; repeated steps (one per GO batch) add up.
+    fn done(&mut self, name: &str) {
+        let ms = self.last.elapsed().as_millis() as u64;
+        match self.steps.iter_mut().find(|s| s.0 == name) {
+            Some(s) => s.1 += ms,
+            None => self.steps.push((name.into(), ms)),
+        }
+    }
 }
 
 #[derive(Serialize, Default, Debug)]
@@ -38,6 +87,7 @@ pub struct QueryResult {
     pub results: Vec<ResultSet>,
     pub messages: Vec<String>,
     elapsed_ms: u64,
+    steps: Vec<(String, u64)>,
 }
 
 pub fn fmt_err(e: tiberius::error::Error) -> String {
@@ -52,12 +102,13 @@ pub fn fmt_err(e: tiberius::error::Error) -> String {
 
 impl Db {
     /// Entra ID token for Azure SQL from the user's `az login` session, cached until 5 min before expiry.
-    async fn azure_token(&self, tenant: Option<&str>) -> Result<String, String> {
+    /// Returns (token, came from cache).
+    pub async fn azure_token(&self, tenant: Option<&str>) -> Result<(String, bool), String> {
         let key = tenant.unwrap_or("").to_string();
         let mut cache = self.tokens.lock().await;
         if let Some((tok, exp)) = cache.get(&key) {
             if *exp - 300 > chrono::Utc::now().timestamp() {
-                return Ok(tok.clone());
+                return Ok((tok.clone(), true));
             }
         }
         let mut cmd = tokio::process::Command::new(az_bin());
@@ -76,10 +127,10 @@ impl Db {
         let tok = v["accessToken"].as_str().ok_or("az: no accessToken")?.to_string();
         let exp = v["expires_on"].as_i64().unwrap_or_else(|| chrono::Utc::now().timestamp() + 1800);
         cache.insert(key, (tok.clone(), exp));
-        Ok(tok)
+        Ok((tok, false))
     }
 
-    pub async fn connect(&self, c: &Conn, password: Option<String>, database: Option<&str>) -> Result<Tds, String> {
+    pub async fn connect(&self, c: &Conn, password: Option<String>, database: Option<&str>, tr: &mut Trace) -> Result<Tds, String> {
         let mut cfg = Config::new();
         cfg.host(&c.server);
         cfg.port(c.port);
@@ -92,7 +143,12 @@ impl Db {
         }
         cfg.readonly(c.read_only);
         cfg.authentication(match c.auth.as_str() {
-            "azure_cli" => AuthMethod::aad_token(self.azure_token(c.tenant.as_deref().filter(|t| !t.is_empty())).await?),
+            "azure_cli" => {
+                tr.go(Some("Getting Azure token"));
+                let (tok, cached) = self.azure_token(c.tenant.as_deref().filter(|t| !t.is_empty())).await?;
+                tr.done(if cached { "Azure token (cached)" } else { "Azure token" });
+                AuthMethod::aad_token(tok)
+            }
             _ => {
                 let pw = match password {
                     Some(p) => Some(p),
@@ -103,15 +159,25 @@ impl Db {
             }
         });
         // Azure SQL may redirect to the node that holds the database; follow it once.
-        for _ in 0..2 {
-            let tcp = tokio::time::timeout(std::time::Duration::from_secs(15), TcpStream::connect(cfg.get_addr()))
+        for hop in ["", " (redirected)"] {
+            tr.go(Some("Connecting (TCP)"));
+            let tcp = tokio::time::timeout(Duration::from_secs(15), TcpStream::connect(cfg.get_addr()))
                 .await
                 .map_err(|_| format!("Timed out connecting to {}", cfg.get_addr()))?
                 .map_err(|e| format!("{}: {e}", cfg.get_addr()))?;
+            tr.done(&format!("TCP{hop}"));
             tcp.set_nodelay(true).ok();
+            // Keeps idle sessions and pre-opened connections alive through VPN/NAT and the Azure gateway idle timeout.
+            let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30)).with_interval(Duration::from_secs(10));
+            socket2::SockRef::from(&tcp).set_tcp_keepalive(&ka).ok();
+            tr.go(Some("Logging in (TLS + auth)"));
             match Client::connect(cfg.clone(), tcp.compat_write()).await {
-                Ok(client) => return Ok(client),
+                Ok(client) => {
+                    tr.done(&format!("Login{hop}"));
+                    return Ok(client);
+                }
                 Err(tiberius::error::Error::Routing { host, port }) => {
+                    tr.done("Login, then redirect");
                     cfg.host(&host);
                     cfg.port(port);
                 }
@@ -121,22 +187,64 @@ impl Db {
         Err("Too many redirects".into())
     }
 
-    async fn take(&self, session: &str, c: &Conn, database: Option<&str>) -> Result<Tds, String> {
-        let key = (c.clone(), database.map(String::from));
+    async fn take(&self, session: &str, c: &Conn, database: Option<&str>, tr: &mut Trace) -> Result<Tds, String> {
+        let key = key(c, database);
         let existing = self.sessions.lock().unwrap().remove(session);
-        match existing {
-            Some(s) if s.key == key => Ok(s.client),
-            _ => self.connect(c, None, database).await,
+        if let Some(s) = existing.filter(|s| s.key == key) {
+            tr.done("Connection reused");
+            return Ok(s.client);
         }
+        let spare = {
+            let mut sp = self.spares.lock().unwrap();
+            sp.iter().position(|(k, s)| *k == key && s.is_some()).and_then(|i| sp.swap_remove(i).1)
+        };
+        let client = match spare {
+            Some(cl) => {
+                tr.done("Pre-opened connection");
+                cl
+            }
+            None => self.connect(c, None, database, tr).await?,
+        };
+        self.refill(key);
+        Ok(client)
+    }
+
+    /// Open one spare connection per key in the background, so the next new tab or
+    /// "Select Top" on that database skips the TCP + TLS + login round trips.
+    fn refill(&self, key: Key) {
+        let Some(app) = self.app.get().cloned() else { return };
+        {
+            let mut sp = self.spares.lock().unwrap();
+            if sp.iter().any(|(k, _)| *k == key) {
+                return;
+            }
+            sp.retain(|(k, _)| k.0.id != key.0.id || k.0 == key.0); // spares of an edited connection
+            sp.push((key.clone(), None));
+        }
+        tauri::async_runtime::spawn(async move {
+            let db = app.state::<Db>();
+            let r = db.connect(&key.0, None, key.1.as_deref(), &mut Trace::quiet()).await;
+            let mut sp = db.spares.lock().unwrap();
+            let slot = sp.iter().position(|(k, s)| *k == key && s.is_none());
+            match (r, slot) {
+                (Ok(cl), Some(i)) => sp[i].1 = Some(cl),
+                (Err(_), Some(i)) => drop(sp.swap_remove(i)),
+                _ => {} // slot removed by close(): drop the new connection
+            }
+        });
     }
 
     fn put(&self, session: &str, c: &Conn, database: Option<&str>, client: Tds) {
-        let key = (c.clone(), database.map(String::from));
+        let key = key(c, database);
         self.sessions.lock().unwrap().insert(session.into(), Session { key, client });
     }
 
     pub fn close(&self, session: &str) {
         self.sessions.lock().unwrap().remove(session);
+        // Closing a database's explorer session (before drop database) also closes its spare connections.
+        if let Some((id, db)) = session.strip_prefix("explorer:").and_then(|s| s.split_once(':')) {
+            self.spares.lock().unwrap().retain(|(k, _)| !(k.0.id == id && k.1.as_deref() == Some(db)));
+        }
     }
 
     pub fn cancel(&self, session: &str) {
@@ -148,9 +256,13 @@ impl Db {
     /// Run a small metadata query on a per-(conn, db) explorer session.
     pub async fn meta(&self, c: &Conn, database: Option<&str>, sql: &str, params: &[&str]) -> Result<Vec<Vec<Option<String>>>, String> {
         let session = format!("explorer:{}:{}", c.id, database.unwrap_or(""));
-        let mut client = self.take(&session, c, database).await?;
+        let mut tr = Trace::new(self, &session);
+        let mut client = self.take(&session, c, database, &mut tr).await?;
+        tr.go(Some("Loading"));
         let p: Vec<&dyn tiberius::ToSql> = params.iter().map(|s| s as &dyn tiberius::ToSql).collect();
         let rows = async { client.query(sql, &p).await?.into_first_result().await }.await.map_err(fmt_err)?;
+        tr.done("Query");
+        tr.go(None);
         self.put(&session, c, database, client);
         Ok(rows.into_iter().map(|r| r.into_iter().map(|cd| fmt_value(&cd)).collect()).collect())
     }
@@ -169,23 +281,26 @@ impl Db {
                 }
             }
         }
-        let mut client = self.take(session, c, database).await?;
+        let mut tr = Trace::new(self, session);
+        let mut client = self.take(session, c, database, &mut tr).await?;
         let task = tokio::spawn(async move {
-            let r = run_batches(&mut client, &batches, read_only, max).await;
-            (client, r)
+            let r = run_batches(&mut client, &batches, read_only, max, &mut tr).await;
+            tr.go(None);
+            (client, r, tr.steps)
         });
         self.running.lock().unwrap().insert(session.into(), task.abort_handle());
         let joined = task.await;
         self.running.lock().unwrap().remove(session);
         match joined {
             Err(_) => Err("Query cancelled. The connection was closed; a statement already running on the server may still finish.".into()),
-            Ok((client, Ok((res, reusable)))) => {
+            Ok((client, Ok((mut res, reusable)), steps)) => {
                 if reusable {
                     self.put(session, c, database, client);
                 }
+                res.steps = steps;
                 Ok(res)
             }
-            Ok((client, Err((e, reusable)))) => {
+            Ok((client, Err((e, reusable)), _)) => {
                 if reusable {
                     self.put(session, c, database, client);
                 }
@@ -207,7 +322,7 @@ fn az_bin() -> std::path::PathBuf {
 
 /// Ok/Err carry `reusable`: false when the connection is mid-stream or broken and must be dropped.
 /// Session invariant between batches: SET ROWCOUNT 0 and no transaction opened by us.
-async fn run_batches(client: &mut Tds, batches: &[String], read_only: bool, max: usize) -> Result<(QueryResult, bool), (String, bool)> {
+async fn run_batches(client: &mut Tds, batches: &[String], read_only: bool, max: usize, tr: &mut Trace) -> Result<(QueryResult, bool), (String, bool)> {
     let start = Instant::now();
     let mut out = QueryResult::default();
     let n = batches.len();
@@ -228,7 +343,7 @@ async fn run_batches(client: &mut Tds, batches: &[String], read_only: bool, max:
         } else {
             (b.clone(), "")
         };
-        let r = run_one(client, &text, &mut out, max, read_only || reads).await;
+        let r = run_one(client, &text, &mut out, max, read_only || reads, tr).await;
         // The in-batch cleanup did not run after an error. A mid-stream or broken connection is dropped
         // instead; the server then resets it on its own.
         if let Err(tiberius::error::Error::Server(e)) = &r {
@@ -262,9 +377,16 @@ async fn run_batches(client: &mut Tds, batches: &[String], read_only: bool, max:
 
 /// Ok(false) = row cap hit and the stream was abandoned. `server_capped`: SET ROWCOUNT max+1 is active,
 /// so at most one extra row per result set arrives and we can keep reading.
-async fn run_one(client: &mut Tds, sql: &str, out: &mut QueryResult, max: usize, server_capped: bool) -> tiberius::Result<bool> {
+async fn run_one(client: &mut Tds, sql: &str, out: &mut QueryResult, max: usize, server_capped: bool, tr: &mut Trace) -> tiberius::Result<bool> {
+    tr.go(Some("Waiting for server"));
     let mut stream = client.simple_query(sql).await?.into_stream();
+    let mut first = true; // "Server" = until the first response; "Rows" = the rest of the stream
     while let Some(item) = stream.try_next().await? {
+        if first {
+            first = false;
+            tr.done("Server");
+            tr.go(Some("Receiving rows"));
+        }
         match item {
             QueryItem::Metadata(m) => out.results.push(ResultSet {
                 columns: m.columns().iter().map(|c| c.name().to_string()).collect(),
@@ -277,12 +399,14 @@ async fn run_one(client: &mut Tds, sql: &str, out: &mut QueryResult, max: usize,
                     if server_capped {
                         continue;
                     }
+                    tr.done("Rows");
                     return Ok(false);
                 }
                 rs.rows.push(row.into_iter().map(|cd| fmt_value(&cd)).collect());
             }
         }
     }
+    tr.done(if first { "Server" } else { "Rows" });
     // Turn our appended `SELECT @@ROWCOUNT` into a message.
     if out.results.last().is_some_and(|r| r.columns == [ROWCOUNT_COL]) {
         let rs = out.results.pop().unwrap();
@@ -343,7 +467,7 @@ mod live {
         let db = Db::default();
         let c = conn("localhost", "sql", Some("tempdb"));
         let pw = std::env::var("DBS_SA_PW").unwrap();
-        db.put("s", &c, None, db.connect(&c, Some(pw), None).await.unwrap());
+        db.put("s", &c, None, db.connect(&c, Some(pw), None, &mut Trace::quiet()).await.unwrap());
         let r = db.run(&c, None, "s", "CREATE TABLE #t(id int, g uniqueidentifier, d datetime2, m decimal(10,2), b varbinary(4), x nvarchar(10))\nGO\n\
             INSERT #t VALUES (1, NEWID(), '2024-01-02 03:04:05.678', 12.5, 0x0A0B, N'héllo'),(2,NULL,NULL,NULL,NULL,NULL)\nGO\nSELECT * FROM #t; SELECT 1 a, 2 b", false, 1000).await.unwrap();
         println!("{}", serde_json::to_string(&r).unwrap());
@@ -365,7 +489,7 @@ mod live {
         assert!(r.unwrap_err().starts_with("Query cancelled."));
         assert!(t0.elapsed().as_secs() < 2);
         // Row cap.
-        db.put("s2", &c, None, db.connect(&c, Some(std::env::var("DBS_SA_PW").unwrap()), None).await.unwrap());
+        db.put("s2", &c, None, db.connect(&c, Some(std::env::var("DBS_SA_PW").unwrap()), None, &mut Trace::quiet()).await.unwrap());
         let r = db.run(&c, None, "s2", "SELECT TOP 60000 a.object_id FROM sys.all_columns a CROSS JOIN sys.all_columns b", false, 50_000).await.unwrap();
         assert!(r.results[0].truncated && r.results[0].rows.len() == 50_000);
         println!("cap run {} ms", r.elapsed_ms);
@@ -383,7 +507,7 @@ mod live {
     async fn row_limit_and_session_invariants() {
         let db = Db::default();
         let c = conn("localhost", "sql", Some("tempdb"));
-        db.put("s", &c, None, db.connect(&c, Some(std::env::var("DBS_SA_PW").unwrap()), None).await.unwrap());
+        db.put("s", &c, None, db.connect(&c, Some(std::env::var("DBS_SA_PW").unwrap()), None, &mut Trace::quiet()).await.unwrap());
         let run = |sql: &'static str, ro: bool, max: usize| db.run(&c, None, "s", sql, ro, max);
         // Self-contained data: session temp tables (5k customers, 200k orders) in tempdb.
         run("SELECT TOP (5000) CAST(ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS int) Id, CAST(N'n' AS nvarchar(50)) Name INTO #Customers FROM sys.all_objects a CROSS JOIN sys.all_objects b;

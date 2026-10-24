@@ -8,7 +8,7 @@ use db::{Db, QueryResult};
 use serde::Serialize;
 use store::{Conn, NewTodo, Todo};
 use std::collections::BTreeMap;
-use tauri::State;
+use tauri::{Manager, State};
 
 type R<T> = Result<T, String>;
 
@@ -48,7 +48,7 @@ fn delete_connection(id: String) -> R<()> {
 
 #[tauri::command]
 async fn test_connection(db: State<'_, Db>, conn: Conn, password: Option<String>) -> R<String> {
-    let mut client = db.connect(&conn, password.filter(|p| !p.is_empty()), None).await?;
+    let mut client = db.connect(&conn, password.filter(|p| !p.is_empty()), None, &mut db::Trace::quiet()).await?;
     let row = client.simple_query("SELECT @@VERSION").await.map_err(db::fmt_err)?.into_row().await.map_err(db::fmt_err)?;
     Ok(row.and_then(|r| r.get::<&str, _>(0).map(|s| s.lines().next().unwrap_or("").to_string())).unwrap_or_default())
 }
@@ -282,6 +282,17 @@ pub fn run() {
                 ])?,
             ])?;
             app.set_menu(menu)?;
+            app.state::<Db>().app.set(h.clone()).ok();
+            // Warm the Azure token cache: `az` takes 1-3 s, and the first connection would wait for it.
+            let h2 = h.clone();
+            tauri::async_runtime::spawn(async move {
+                let conns = store::load_conns().unwrap_or_default();
+                let tenants: std::collections::BTreeSet<Option<String>> =
+                    conns.into_iter().filter(|c| c.auth == "azure_cli").map(|c| c.tenant.filter(|t| !t.is_empty())).collect();
+                for t in tenants {
+                    let _ = h2.state::<Db>().azure_token(t.as_deref()).await;
+                }
+            });
             #[cfg(debug_assertions)]
             if std::env::var("DBSTUDIO_DEV_BRIDGE").as_deref() == Ok("1") {
                 devbridge::start(app.handle().clone());

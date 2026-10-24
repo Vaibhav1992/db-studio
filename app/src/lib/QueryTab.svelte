@@ -7,7 +7,7 @@
   import { syntaxHighlighting, HighlightStyle, bracketMatching } from '@codemirror/language';
   import { tags as t } from '@lezer/highlight';
   import { api, clipboard, type QueryResult } from './api';
-  import { app, connOf, databases, execute, CANCELLED, drag, ui, qid, copyText, KEYWORDS, intel, schemaKey, schemaOf, loadSchema, clearSchema, type Tab } from './store.svelte';
+  import { app, connOf, databases, execute, CANCELLED, drag, ui, qid, copyText, KEYWORDS, intel, schemaKey, schemaOf, loadSchema, clearSchema, phases, fmtMs, fmtSteps, type Tab } from './store.svelte';
   import Grid from './Grid.svelte';
   import Icon from './Icon.svelte';
   import ContextMenu, { SEP, type MenuItem } from './ContextMenu.svelte';
@@ -30,6 +30,7 @@
   let dbs = $state<string[]>([]);
   let dbErr = $state('');
   let ms = $state(0);
+  let steps = $state<[string, number][]>([]);
   let cancelled = $state(false);
   let el = $state(0); // elapsed seconds while running
   let rid = 0; // run token: a late result of an older run is ignored
@@ -195,15 +196,15 @@
     if (!text.trim()) return;
     if (!conn) { err = 'Select a connection first.'; cancelled = false; pane = -1; return; }
     const my = ++rid;
-    running = true; err = ''; cancelled = false; el = 0; const t0 = performance.now();
+    running = true; err = ''; cancelled = false; el = 0; steps = []; delete phases[tab.id]; const t0 = performance.now();
     try {
       const r = await execute(conn, tab.database, tab.id, text, tab.readOnly, tab.maxRows);
       if (my !== rid) return;
-      res = r; ms = r.elapsed_ms;
+      res = r; steps = r.steps; ms = steps.reduce((a, s) => a + s[1], 0);
       pane = r.results.length ? 0 : -1;
     } catch (e) {
       if (my !== rid) return;
-      res = null; err = e === CANCELLED ? '' : String(e); pane = -1; ms = Math.round(performance.now() - t0);
+      res = null; err = e === CANCELLED ? '' : String(e); pane = -1; ms = Math.round(performance.now() - t0); steps = phases[tab.id]?.steps ?? [];
     } finally {
       if (my === rid) running = false;
     }
@@ -261,7 +262,7 @@
     <span class="sep"></span>
     {#if running}
       <button class="stop" onclick={cancel} title="Cancel (Esc)" data-testid="cancel"><Icon name="stop" size={14} />Cancel</button>
-      <span class="dim" data-testid="elapsed">Running… {el.toFixed(1)} s</span>
+      <span class="dim" data-testid="elapsed">Running… {el.toFixed(1)} s{phases[tab.id]?.now ? ` · ${phases[tab.id].now}` : ''}</span>
     {:else}
       <button class="run" onclick={run} title="Run (Cmd+Enter; selection if any)" data-testid="run"><Icon name="run" size={14} />Run</button>
     {/if}
@@ -303,7 +304,7 @@
       {/if}
     </div>
     <div class="st dim" data-testid="status">
-      {#if rs}{rs.rows.length.toLocaleString()} rows{rs.truncated ? ' (truncated)' : ''} · {/if}{res || err || cancelled ? ms + ' ms · ' : ''}{conn?.name ?? '-'}/{dbName}
+      {#if rs}{rs.rows.length.toLocaleString()} rows{rs.truncated ? ' (truncated)' : ''} · {/if}{res || err || cancelled ? fmtMs(ms) + (steps.length ? ` (${fmtSteps(steps)})` : '') + ' · ' : ''}{conn?.name ?? '-'}/{dbName}
     </div>
   </div>
 </div>

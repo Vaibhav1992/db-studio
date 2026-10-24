@@ -1,7 +1,13 @@
 // Shared app state. Results are NOT kept here (they live in each QueryTab, never persisted).
 import { sql, MSSQL } from '@codemirror/lang-sql';
 import type { Extension } from '@codemirror/state';
-import { api, clipboard, type Conn, type Env, type QueryResult } from './api';
+import { api, clipboard, type Conn, type Env, type Phase, type QueryResult, type Steps } from './api';
+
+/** Latest phase per session key (tab id, `explorer:<conn>:<db>`), fed by the backend. */
+export const phases = $state<Record<string, Phase>>({});
+api.onPhase((p) => (phases[p.session] = p));
+export const fmtMs = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`);
+export const fmtSteps = (s: Steps = []) => s.map(([n, ms]) => (ms ? `${n} ${fmtMs(ms)}` : n)).join(' · ');
 
 /** Copy text and say so in the status bar. */
 export const copyText = (text: string, what: string) =>
