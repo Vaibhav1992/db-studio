@@ -83,3 +83,21 @@ EXEC dbo.usp_NormalizeEmails;
 - `card`: work item id. A prod run needs `execute prod <card>`.
 - `status`: `todo`, `done` or `failed`. Only the app writes `done`/`failed` and the `note` line.
 - Unknown header keys are kept. Separate batches with `GO` lines.
+
+## Release
+
+```sh
+./release.sh 0.2.0
+```
+
+It runs on this Mac only (no CI). It first stops if any of these is wrong: the personal `gh` login
+(`GH_CONFIG_DIR=~/.config/gh-personal`) is not Vaibhav1992, no remote points to
+`git@github-personal:Vaibhav1992/db-studio.git`, the branch is not `main`, the tree is not clean,
+HEAD is not the remote's `main`, the version is not `x.y.z`, or the tag already exists.
+Then it builds with the version stamped in, runs `pnpm check` and `cargo test`, checks the signature,
+version and start of the built app, makes `dist/DB-Studio-<x.y.z>.dmg`, tags `v<x.y.z>`, pushes the tag,
+and creates the GitHub release with the DMG.
+
+**Install:** open the DMG and drag **DB Studio** to **Applications**. The app is signed with an
+Apple Development certificate, not notarized, so macOS blocks the first start of a downloaded copy.
+Right-click the app > **Open**, or run `xattr -dr com.apple.quarantine "/Applications/DB Studio.app"`.

@@ -79,8 +79,13 @@ Run from `app/`:
 | Rust unit tests | `cd src-tauri && cargo test` |
 | Live tests (local SQL Server only) | `cd src-tauri && DBS_SA_PW=<sa password> cargo test live -- --ignored` |
 | Release app | `pnpm app`, which writes `src-tauri/target/release/bundle/macos/DB Studio.app` |
+| GitHub release (repo root) | `./release.sh <x.y.z>`: checks, build, tests, smoke test, `dist/DB-Studio-<x.y.z>.dmg`, tag, `gh release` |
 
 The live tests make their own temp tables in `tempdb`, so they need no test database.
+
+Release rules: run `release.sh` only from a clean `main` that equals the personal remote. It uses
+`GH_CONFIG_DIR=~/.config/gh-personal` (account Vaibhav1992). `origin` is the work account repo: never push
+releases there, never run `gh auth switch`, and never edit the global git config.
 
 ## Browser testing (dev bridge)
 

@@ -7,3 +7,4 @@ app/src-tauri/gen/
 .env
 .env.*
 *.local.*
+/dist/
