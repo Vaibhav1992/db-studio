@@ -27,6 +27,9 @@ signature, macOS remembers "Always Allow" for Keychain passwords. Without it, ev
 - One connection per database you use, grouped by environment: Local, Dev, QA, Prod.
   A connection with a database shows only that database. A connection without one shows the whole server.
 - Right-click a database > **Add as connection...** to make a connection for it.
+- **Filter** (box above the tree): type part of a name, for example `usp_Sched` or `dbo.Order`, to show only the
+  matching tables, views, procedures and functions in the open databases. It searches the loaded names, with no
+  server call. Esc clears it.
 - **SQL login**: server, port, user, password. Local Docker SQL Server needs "Trust server certificate".
 - **Microsoft Entra ID (Azure CLI)**: uses your `az login` session (the Microsoft access-token flow).
 - Stored in `~/.dbstudio/connections.json`. Passwords are in the macOS Keychain (service `dbstudio`),

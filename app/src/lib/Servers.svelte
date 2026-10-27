@@ -13,6 +13,12 @@
   let editing = $state<Conn | null | undefined>(undefined); // undefined = closed, null = new
   let selected = $state('');
   let menu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
+  // Object filter: matches schema.name anywhere, case-insensitive, over the objects already loaded for expanded
+  // databases (no server call). While it is set, folders with matches open by themselves; fopen holds the ones
+  // the user closes, and is reset when the filter text changes.
+  let filter = $state('');
+  let fopen = $state<Record<string, boolean>>({});
+  const q = $derived(filter.trim().toLowerCase());
 
   const KINDS: [DbObject['kind'], string][] = [['table', 'Tables'], ['view', 'Views'], ['procedure', 'Procedures'], ['function', 'Functions']];
 
@@ -57,10 +63,11 @@
           const objs = cache[bk];
           if (!objs?.data) { msg(r, bk, d + 1, objs ?? {}, `explorer:${c.id}:${db}`); continue; }
           for (const [kind, title] of KINDS) {
-            const list: DbObject[] = (objs.data as DbObject[]).filter((x) => x.kind === kind);
-            const gk = `${bk}|${kind}`;
-            r.push({ key: gk, depth: d + 1, label: title, count: list.length, kind: 'dir', open: open[gk], folder: !!list.length, c, db });
-            if (!open[gk]) continue;
+            const list: DbObject[] = (objs.data as DbObject[]).filter((x) => x.kind === kind && (!q || `${x.schema}.${x.name}`.toLowerCase().includes(q)));
+            if (q && !list.length) continue;
+            const gk = `${bk}|${kind}`, gopen = q ? (fopen[gk] ?? true) : open[gk];
+            r.push({ key: gk, depth: d + 1, label: title, count: list.length, kind: 'dir', open: gopen, folder: !!list.length, c, db });
+            if (!gopen) continue;
             for (const o of list) {
               const ok = `${gk}|${o.schema}.${o.name}`;
               r.push({ key: ok, depth: d + 2, label: o.name, sub: o.schema, kind: 'obj', open: open[ok], folder: kind === 'table', c, db, o });
@@ -81,6 +88,7 @@
   function toggle(row: Row) {
     if (!row.folder) return;
     const k = row.key;
+    if (q && row.kind === 'dir' && row.db) { fopen[k] = !row.open; return; } // object folders while filtering
     open[k] = !(open[k] ?? ((row.kind === 'dir' && row.label === 'Databases') || (row.kind === 'db' && row.db === row.c?.database)));
     if (!open[k]) return;
     const c = row.c!;
@@ -198,6 +206,11 @@
   <span class="grow"></span>
   <button class="icon" onclick={refresh} title="Refresh all" data-testid="tree-refresh"><Icon name="refresh" size={14} /></button>
 </div>
+<div class="find">
+  <input placeholder="Filter tables, views, procedures..." bind:value={filter} oninput={() => (fopen = {})} spellcheck="false"
+    onkeydown={(e) => { if (e.key === 'Escape') { filter = ''; fopen = {}; e.stopPropagation(); } }} data-testid="tree-filter" />
+  {#if filter}<button class="icon clear" title="Clear (Esc)" onclick={() => { filter = ''; fopen = {}; }}><Icon name="close" size={12} /></button>{/if}
+</div>
 <div class="tree" role="tree">
   {#each rows as r (r.key)}
     {@const kind = r.o?.kind ?? r.kind}
@@ -221,7 +234,8 @@
       {#if ['conn', 'db', 'obj'].includes(r.kind)}<button class="icon more" title="Actions" onclick={(e) => ctx(e, r, e.currentTarget)}><Icon name="more" size={14} /></button>{/if}
     </div>
   {/each}
-  {#if !app.conns.length}<div class="dim pad">No connections yet. Click "New connection".</div>{/if}
+  {#if !app.conns.length}<div class="dim pad">No connections yet. Click "New connection".</div>
+  {:else if q && !rows.some((r) => r.kind === 'obj')}<div class="dim pad">No matching objects in the open databases.</div>{/if}
 </div>
 
 {#if menu}<ContextMenu {...menu} onclose={() => (menu = null)} />{/if}
@@ -231,6 +245,9 @@
 
 <style>
   .bar { display: flex; align-items: center; gap: 4px; padding: 6px 8px; border-bottom: 1px solid var(--bd); }
+  .find { position: relative; padding: 6px 8px; border-bottom: 1px solid var(--bd); }
+  .find input { width: 100%; padding-right: 26px; }
+  .find .clear { position: absolute; right: 10px; top: 8px; }
   .tree { flex: 1; overflow: auto; padding: 4px 0; }
   .n { display: flex; align-items: center; gap: 4px; height: 24px; white-space: nowrap; padding-right: 4px; }
   .n:hover { background: var(--hover); }
